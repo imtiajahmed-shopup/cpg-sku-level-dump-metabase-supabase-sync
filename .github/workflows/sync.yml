@@ -1,0 +1,29 @@
+name: CPG Metabase to Supabase Sync
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run sync
+        env:
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          METABASE_CARD_ID: ${{ secrets.METABASE_CARD_ID }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          FULL_REFRESH: "true"
+        run: node index.js
