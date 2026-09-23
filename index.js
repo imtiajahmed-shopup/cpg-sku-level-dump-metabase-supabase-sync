@@ -148,6 +148,16 @@ async function loadCSVToStaging(client, csvFile) {
 
   console.log("Starting CSV → staging table load...");
 
+  console.log("");
+  console.log("========== CSV PREVIEW ==========");
+
+  const csvPreview = fs.readFileSync(csvFile, "utf8");
+
+  console.log(csvPreview.slice(0, 3000));
+
+  console.log("========== END CSV PREVIEW ==========");
+  console.log("");
+
   const copySQL = `
     COPY public.stg_cpg_sku_order_line (
       dms_order_id,
