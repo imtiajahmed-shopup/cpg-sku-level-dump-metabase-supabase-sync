@@ -21,9 +21,9 @@ jobs:
 
       - name: Run sync
         env:
-          METABASE_URL: ${{ secrets.METABASE_URL }}
-          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
-          METABASE_CARD_ID: ${{ secrets.METABASE_CARD_ID }}
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          FULL_REFRESH: "true"
+            METABASE_URL: ${{ secrets.METABASE_URL }}
+            METABASE_SESSION_TOKEN: ${{ secrets.METABASE_SESSION_TOKEN }}
+            METABASE_CARD_ID: ${{ secrets.METABASE_CARD_ID }}
+            SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+            FULL_REFRESH: "true"
         run: node index.js
