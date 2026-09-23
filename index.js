@@ -19,6 +19,36 @@ const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
 const FULL_REFRESH =
   String(process.env.FULL_REFRESH || "true").toLowerCase() === "true";
 
+// Dhaka is UTC+6 year-round (no DST), so we can shift the clock instead
+// of pulling in a timezone library.
+const DHAKA_OFFSET_MS = 6 * 60 * 60 * 1000;
+
+function dhakaDateISOString(offsetDays = 0) {
+  const shifted = new Date(
+    Date.now() + DHAKA_OFFSET_MS + offsetDays * 24 * 60 * 60 * 1000
+  );
+  return new Date(
+    Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate())
+  )
+    .toISOString()
+    .slice(0, 10);
+}
+
+function dhakaFirstOfMonthISOString() {
+  const shifted = new Date(Date.now() + DHAKA_OFFSET_MS);
+  return new Date(Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), 1))
+    .toISOString()
+    .slice(0, 10);
+}
+
+// Card 9548 requires "from" and "to" date parameters. Defaults to
+// "start of current month" -> "yesterday" (Asia/Dhaka), but both can be
+// overridden via env vars without touching code.
+const METABASE_FROM_DATE =
+  process.env.METABASE_FROM_DATE || dhakaFirstOfMonthISOString();
+const METABASE_TO_DATE =
+  process.env.METABASE_TO_DATE || dhakaDateISOString(-1);
+
 
 // ============================================================
 // VALIDATE ENVIRONMENT
@@ -59,6 +89,7 @@ async function downloadMetabaseCSV(outputFile) {
   console.log("========================================");
   console.log(`Card ID: ${METABASE_CARD_ID}`);
   console.log(`URL: ${url}`);
+  console.log(`Date range: ${METABASE_FROM_DATE} -> ${METABASE_TO_DATE}`);
 
   const response = await fetch(url, {
     method: "POST",
@@ -69,6 +100,18 @@ async function downloadMetabaseCSV(outputFile) {
     },
 
     body: JSON.stringify({
+      parameters: [
+        {
+          type: "date/single",
+          target: ["variable", ["template-tag", "from"]],
+          value: METABASE_FROM_DATE
+        },
+        {
+          type: "date/single",
+          target: ["variable", ["template-tag", "to"]],
+          value: METABASE_TO_DATE
+        }
+      ],
       format_rows: false
     })
   });
@@ -98,6 +141,18 @@ async function downloadMetabaseCSV(outputFile) {
 
   if (stats.size === 0) {
     throw new Error("Metabase returned a zero-byte CSV.");
+  }
+
+  // Metabase's /query/csv endpoint can return HTTP 200 with a JSON error
+  // payload instead of actual CSV data (e.g. missing required parameters,
+  // query execution errors). Catch that here instead of silently loading
+  // it into Postgres.
+  const preview = fs.readFileSync(outputFile, "utf8").slice(0, 1000).trim();
+
+  if (preview.startsWith("{") || preview.startsWith("[")) {
+    throw new Error(
+      `Metabase returned an error payload instead of CSV data:\n${preview}`
+    );
   }
 
   console.log(
@@ -147,16 +202,6 @@ async function loadCSVToStaging(client, csvFile) {
   console.log("Staging table cleared.");
 
   console.log("Starting CSV → staging table load...");
-
-  console.log("");
-  console.log("========== CSV PREVIEW ==========");
-
-  const csvPreview = fs.readFileSync(csvFile, "utf8");
-
-  console.log(csvPreview.slice(0, 3000));
-
-  console.log("========== END CSV PREVIEW ==========");
-  console.log("");
 
   const copySQL = `
     COPY public.stg_cpg_sku_order_line (
