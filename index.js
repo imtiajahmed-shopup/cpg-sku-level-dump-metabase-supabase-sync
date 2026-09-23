@@ -866,7 +866,7 @@ async function transformAndLoad(client) {
 
               regexp_replace(
                 TRIM(s.pick_list_ids),
-                '[\[\]\s]',
+                '[^0-9,]',
                 '',
                 'g'
               ),
