@@ -8,24 +8,26 @@ const { from: copyFrom } = require("pg-copy-streams");
 
 
 // ============================================================
-// CONFIG
+// CONFIGURATION
 // ============================================================
 
 const METABASE_URL = process.env.METABASE_URL?.replace(/\/+$/, "");
-const METABASE_API_KEY = process.env.METABASE_API_KEY;
+const METABASE_SESSION_TOKEN = process.env.METABASE_SESSION_TOKEN;
 const METABASE_CARD_ID = process.env.METABASE_CARD_ID;
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
 
-// First version = full refresh.
-// Later we will change this to incremental refresh.
 const FULL_REFRESH =
   String(process.env.FULL_REFRESH || "true").toLowerCase() === "true";
 
 
+// ============================================================
+// VALIDATE ENVIRONMENT
+// ============================================================
+
 function validateEnvironment() {
   const required = {
     METABASE_URL,
-    METABASE_API_KEY,
+    METABASE_SESSION_TOKEN,
     METABASE_CARD_ID,
     SUPABASE_DB_URL
   };
@@ -44,25 +46,28 @@ function validateEnvironment() {
 
 // ============================================================
 // STEP 1
-// DOWNLOAD CSV FROM METABASE
+// FETCH CSV FROM METABASE
 // ============================================================
 
 async function downloadMetabaseCSV(outputFile) {
   const url =
     `${METABASE_URL}/api/card/${METABASE_CARD_ID}/query/csv`;
 
-  console.log(`Fetching Metabase card: ${METABASE_CARD_ID}`);
+  console.log("");
+  console.log("========================================");
+  console.log("STEP 1: FETCHING DATA FROM METABASE");
+  console.log("========================================");
+  console.log(`Card ID: ${METABASE_CARD_ID}`);
   console.log(`URL: ${url}`);
 
   const response = await fetch(url, {
     method: "POST",
+
     headers: {
-      "X-API-Key": METABASE_API_KEY,
+      "X-Metabase-Session": METABASE_SESSION_TOKEN,
       "Content-Type": "application/json"
     },
 
-    // No dashboard/card filters are being supplied yet.
-    // format_rows=false helps keep raw values unformatted.
     body: JSON.stringify({
       format_rows: false
     })
@@ -72,12 +77,14 @@ async function downloadMetabaseCSV(outputFile) {
     const errorText = await response.text();
 
     throw new Error(
-      `Metabase request failed: ${response.status} ${response.statusText}\n${errorText}`
+      `Metabase request failed.\n` +
+      `Status: ${response.status} ${response.statusText}\n` +
+      `Response: ${errorText}`
     );
   }
 
   if (!response.body) {
-    throw new Error("Metabase returned an empty response body.");
+    throw new Error("Metabase returned an empty response.");
   }
 
   const output = fs.createWriteStream(outputFile);
@@ -89,22 +96,29 @@ async function downloadMetabaseCSV(outputFile) {
 
   const stats = fs.statSync(outputFile);
 
+  if (stats.size === 0) {
+    throw new Error("Metabase returned a zero-byte CSV.");
+  }
+
   console.log(
-    `Metabase CSV downloaded successfully: ${stats.size.toLocaleString()} bytes`
+    `Metabase CSV downloaded successfully.`
+  );
+
+  console.log(
+    `CSV size: ${stats.size.toLocaleString()} bytes`
   );
 }
 
 
 // ============================================================
 // STEP 2
-// CONNECT TO SUPABASE POSTGRES
+// CONNECT TO SUPABASE
 // ============================================================
 
 function createSupabaseClient() {
   return new Client({
     connectionString: SUPABASE_DB_URL,
 
-    // Supabase requires encrypted database connections.
     ssl: {
       rejectUnauthorized: false
     }
@@ -114,17 +128,25 @@ function createSupabaseClient() {
 
 // ============================================================
 // STEP 3
-// LOAD RAW CSV INTO STAGING TABLE
+// LOAD CSV INTO STAGING TABLE
 // ============================================================
 
 async function loadCSVToStaging(client, csvFile) {
+
+  console.log("");
+  console.log("========================================");
+  console.log("STEP 2: LOADING RAW DATA INTO STAGING");
+  console.log("========================================");
+
   console.log("Clearing staging table...");
 
   await client.query(`
     TRUNCATE TABLE public.stg_cpg_sku_order_line;
   `);
 
-  console.log("Loading CSV into staging table...");
+  console.log("Staging table cleared.");
+
+  console.log("Starting CSV → staging table load...");
 
   const copySQL = `
     COPY public.stg_cpg_sku_order_line (
@@ -193,7 +215,24 @@ async function loadCSVToStaging(client, csvFile) {
     copyStream
   );
 
-  console.log("CSV successfully loaded into staging table.");
+  const result = await client.query(`
+    SELECT COUNT(*) AS row_count
+    FROM public.stg_cpg_sku_order_line;
+  `);
+
+  const rowCount = Number(result.rows[0].row_count);
+
+  console.log(
+    `Staging rows loaded: ${rowCount.toLocaleString()}`
+  );
+
+  if (rowCount === 0) {
+    throw new Error(
+      "Staging table contains 0 rows after CSV load."
+    );
+  }
+
+  console.log("Staging load completed successfully.");
 }
 
 
@@ -204,31 +243,31 @@ async function loadCSVToStaging(client, csvFile) {
 
 async function transformAndLoad(client) {
 
-  // Make PostgreSQL interpret Metabase timestamps in Bangladesh time.
+  console.log("");
+  console.log("========================================");
+  console.log("STEP 3: TRANSFORMING AND LOADING DATA");
+  console.log("========================================");
+
+  // Bangladesh timezone
   await client.query(`
     SET TIME ZONE 'Asia/Dhaka';
   `);
-
-
-  // ----------------------------------------------------------
-  // START TRANSACTION
-  // ----------------------------------------------------------
 
   await client.query("BEGIN");
 
   try {
 
-    // --------------------------------------------------------
-    // FIRST VERSION:
-    // FULL REFRESH OF FACT TABLE
-    //
-    // Later we will replace this with incremental loading.
-    // --------------------------------------------------------
+    // ========================================================
+    // FULL REFRESH
+    // ========================================================
 
     if (FULL_REFRESH) {
 
       console.log("FULL_REFRESH=true");
-      console.log("Clearing fact table...");
+
+      console.log(
+        "Clearing fact_cpg_sku_order_line..."
+      );
 
       await client.query(`
         TRUNCATE TABLE public.fact_cpg_sku_order_line;
@@ -236,32 +275,42 @@ async function transformAndLoad(client) {
     }
 
 
-    // --------------------------------------------------------
-    // DB DIMENSION
-    //
-    // The SKU query does not contain DB name.
-    // Therefore we only create/update the DB IDs here.
-    // DB name can later be populated from your master file.
-    // --------------------------------------------------------
+    // ========================================================
+    // 1. DB DIMENSION
+    // ========================================================
 
+    console.log("");
     console.log("Updating dim_db...");
 
     await client.query(`
-      INSERT INTO public.dim_db (db_id)
+      INSERT INTO public.dim_db (
+        db_id,
+        updated_at
+      )
+
       SELECT DISTINCT
-        NULLIF(TRIM(db_id), '')::bigint
+        NULLIF(TRIM(db_id), '')::bigint,
+        now()
+
       FROM public.stg_cpg_sku_order_line
+
       WHERE
         NULLIF(TRIM(db_id), '') IS NOT NULL
         AND TRIM(db_id) ~ '^[0-9]+$'
-      ON CONFLICT (db_id) DO NOTHING;
+
+      ON CONFLICT (db_id)
+      DO UPDATE SET
+        updated_at = now();
     `);
 
+    console.log("dim_db updated.");
 
-    // --------------------------------------------------------
-    // PRODUCT DIMENSION
-    // --------------------------------------------------------
 
+    // ========================================================
+    // 2. PRODUCT DIMENSION
+    // ========================================================
+
+    console.log("");
     console.log("Updating dim_product...");
 
     await client.query(`
@@ -275,6 +324,7 @@ async function transformAndLoad(client) {
         sku_weight_in_gm,
         updated_at
       )
+
       SELECT DISTINCT ON (
         NULLIF(TRIM(product_id), '')::bigint
       )
@@ -329,11 +379,14 @@ async function transformAndLoad(client) {
         updated_at = now();
     `);
 
+    console.log("dim_product updated.");
 
-    // --------------------------------------------------------
-    // DSR DIMENSION
-    // --------------------------------------------------------
 
+    // ========================================================
+    // 3. DSR DIMENSION
+    // ========================================================
+
+    console.log("");
     console.log("Updating dim_dsr...");
 
     await client.query(`
@@ -344,6 +397,7 @@ async function transformAndLoad(client) {
         employee_id,
         updated_at
       )
+
       SELECT DISTINCT ON (
         NULLIF(TRIM(dsr_id), '')::bigint
       )
@@ -377,11 +431,14 @@ async function transformAndLoad(client) {
         updated_at = now();
     `);
 
+    console.log("dim_dsr updated.");
 
-    // --------------------------------------------------------
-    // FACT TABLE
-    // --------------------------------------------------------
 
+    // ========================================================
+    // 4. FINAL FACT TABLE
+    // ========================================================
+
+    console.log("");
     console.log("Loading fact_cpg_sku_order_line...");
 
     await client.query(`
@@ -449,9 +506,9 @@ async function transformAndLoad(client) {
 
       SELECT
 
-        -- ----------------------------------------------------
+        -- ====================================================
         -- SOURCE IDENTIFIERS
-        -- ----------------------------------------------------
+        -- ====================================================
 
         CASE
           WHEN NULLIF(TRIM(s.dms_order_id), '') ~ '^[0-9]+$'
@@ -474,9 +531,9 @@ async function transformAndLoad(client) {
         END,
 
 
-        -- ----------------------------------------------------
+        -- ====================================================
         -- DIMENSION KEYS
-        -- ----------------------------------------------------
+        -- ====================================================
 
         TRIM(s.db_id)::bigint,
 
@@ -495,9 +552,9 @@ async function transformAndLoad(client) {
         NULLIF(TRIM(s.employee_id), ''),
 
 
-        -- ----------------------------------------------------
+        -- ====================================================
         -- TIMESTAMPS
-        -- ----------------------------------------------------
+        -- ====================================================
 
         CASE
           WHEN NULLIF(TRIM(s.created_at), '') IS NOT NULL
@@ -527,11 +584,10 @@ async function transformAndLoad(client) {
         END,
 
 
-        -- ----------------------------------------------------
-        -- BUSINESS DATE
-        --
-        -- MAIN DATE FILTER
-        -- ----------------------------------------------------
+        -- ====================================================
+        -- MAIN BUSINESS DATE
+        -- delivered_date is the dashboard date
+        -- ====================================================
 
         (
           to_timestamp(
@@ -541,9 +597,9 @@ async function transformAndLoad(client) {
         )::date,
 
 
-        -- ----------------------------------------------------
+        -- ====================================================
         -- ORDER ATTRIBUTES
-        -- ----------------------------------------------------
+        -- ====================================================
 
         NULLIF(TRIM(s.order_type), ''),
 
@@ -554,150 +610,195 @@ async function transformAndLoad(client) {
         END,
 
 
-        -- ----------------------------------------------------
-        -- FILTERS
-        -- ----------------------------------------------------
+        -- ====================================================
+        -- DASHBOARD FILTERS
+        -- ====================================================
 
         NULLIF(TRIM(s.sub_anchor_type), ''),
 
         NULLIF(TRIM(s.sub_bu), ''),
 
 
-        -- ----------------------------------------------------
+        -- ====================================================
         -- QUANTITIES
-        -- ----------------------------------------------------
-
-        CASE WHEN NULLIF(TRIM(s.order_qty), '') <> ''
-          THEN REPLACE(TRIM(s.order_qty), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.delivered_qty), '') <> ''
-          THEN REPLACE(TRIM(s.delivered_qty), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.return_qty), '') <> ''
-          THEN REPLACE(TRIM(s.return_qty), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.exchange_qty), '') <> ''
-          THEN REPLACE(TRIM(s.exchange_qty), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.damage_qty), '') <> ''
-          THEN REPLACE(TRIM(s.damage_qty), ',', '')::numeric
-          ELSE NULL END,
-
-
-        CASE WHEN NULLIF(TRIM(s.free_claimable_qty), '') <> ''
-          THEN REPLACE(TRIM(s.free_claimable_qty), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.free_non_claimable_qty), '') <> ''
-          THEN REPLACE(TRIM(s.free_non_claimable_qty), ',', '')::numeric
-          ELSE NULL END,
-
-
-        -- ----------------------------------------------------
-        -- PRICING
-        -- ----------------------------------------------------
-
-        CASE WHEN NULLIF(TRIM(s.lp), '') <> ''
-          THEN REPLACE(TRIM(s.lp), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.sp), '') <> ''
-          THEN REPLACE(TRIM(s.sp), ',', '')::numeric
-          ELSE NULL END,
-
-
-        -- ----------------------------------------------------
-        -- VALUES
-        -- ----------------------------------------------------
-
-        CASE WHEN NULLIF(TRIM(s.order_value), '') <> ''
-          THEN REPLACE(TRIM(s.order_value), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.delivered_value), '') <> ''
-          THEN REPLACE(TRIM(s.delivered_value), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.return_value), '') <> ''
-          THEN REPLACE(TRIM(s.return_value), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.exchange_value), '') <> ''
-          THEN REPLACE(TRIM(s.exchange_value), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.damage_value), '') <> ''
-          THEN REPLACE(TRIM(s.damage_value), ',', '')::numeric
-          ELSE NULL END,
-
-
-        -- ----------------------------------------------------
-        -- FREE ITEM VALUES
-        -- ----------------------------------------------------
-
-        CASE WHEN NULLIF(TRIM(s.free_claimable_value), '') <> ''
-          THEN REPLACE(TRIM(s.free_claimable_value), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.free_non_claimable_value), '') <> ''
-          THEN REPLACE(TRIM(s.free_non_claimable_value), ',', '')::numeric
-          ELSE NULL END,
-
-
-        -- ----------------------------------------------------
-        -- DISCOUNTS
-        -- ----------------------------------------------------
-
-        CASE WHEN NULLIF(TRIM(s.claimable_discount), '') <> ''
-          THEN REPLACE(TRIM(s.claimable_discount), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.non_claimable_discount), '') <> ''
-          THEN REPLACE(TRIM(s.non_claimable_discount), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.non_claimable_discount_total), '') <> ''
-          THEN REPLACE(TRIM(s.non_claimable_discount_total), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.trade_discount), '') <> ''
-          THEN REPLACE(TRIM(s.trade_discount), ',', '')::numeric
-          ELSE NULL END,
-
-        CASE WHEN NULLIF(TRIM(s.claimable_discount_total), '') <> ''
-          THEN REPLACE(TRIM(s.claimable_discount_total), ',', '')::numeric
-          ELSE NULL END,
-
-
-        -- ----------------------------------------------------
-        -- ANCHOR RECEIVABLE
-        -- ----------------------------------------------------
-
-        CASE WHEN NULLIF(TRIM(s.anchor_receivable), '') <> ''
-          THEN REPLACE(TRIM(s.anchor_receivable), ',', '')::numeric
-          ELSE NULL END,
-
-
-        -- ----------------------------------------------------
-        -- MAIN METRIC
-        -- ----------------------------------------------------
-
-        CASE WHEN NULLIF(TRIM(s.nmv), '') <> ''
-          THEN REPLACE(TRIM(s.nmv), ',', '')::numeric
-          ELSE NULL END,
-
-
-        -- ----------------------------------------------------
-        -- PICK LIST IDS
-        -- Example source:
-        -- [3066700]
-        -- ----------------------------------------------------
+        -- ====================================================
 
         CASE
+          WHEN NULLIF(TRIM(s.order_qty), '') <> ''
+          THEN REPLACE(TRIM(s.order_qty), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.delivered_qty), '') <> ''
+          THEN REPLACE(TRIM(s.delivered_qty), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.return_qty), '') <> ''
+          THEN REPLACE(TRIM(s.return_qty), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.exchange_qty), '') <> ''
+          THEN REPLACE(TRIM(s.exchange_qty), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.damage_qty), '') <> ''
+          THEN REPLACE(TRIM(s.damage_qty), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.free_claimable_qty), '') <> ''
+          THEN REPLACE(TRIM(s.free_claimable_qty), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.free_non_claimable_qty), '') <> ''
+          THEN REPLACE(TRIM(s.free_non_claimable_qty), ',', '')::numeric
+          ELSE NULL
+        END,
+
+
+        -- ====================================================
+        -- PRICING
+        -- ====================================================
+
+        CASE
+          WHEN NULLIF(TRIM(s.lp), '') <> ''
+          THEN REPLACE(TRIM(s.lp), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.sp), '') <> ''
+          THEN REPLACE(TRIM(s.sp), ',', '')::numeric
+          ELSE NULL
+        END,
+
+
+        -- ====================================================
+        -- VALUES
+        -- ====================================================
+
+        CASE
+          WHEN NULLIF(TRIM(s.order_value), '') <> ''
+          THEN REPLACE(TRIM(s.order_value), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.delivered_value), '') <> ''
+          THEN REPLACE(TRIM(s.delivered_value), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.return_value), '') <> ''
+          THEN REPLACE(TRIM(s.return_value), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.exchange_value), '') <> ''
+          THEN REPLACE(TRIM(s.exchange_value), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.damage_value), '') <> ''
+          THEN REPLACE(TRIM(s.damage_value), ',', '')::numeric
+          ELSE NULL
+        END,
+
+
+        -- ====================================================
+        -- FREE ITEM VALUES
+        -- ====================================================
+
+        CASE
+          WHEN NULLIF(TRIM(s.free_claimable_value), '') <> ''
+          THEN REPLACE(TRIM(s.free_claimable_value), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.free_non_claimable_value), '') <> ''
+          THEN REPLACE(TRIM(s.free_non_claimable_value), ',', '')::numeric
+          ELSE NULL
+        END,
+
+
+        -- ====================================================
+        -- DISCOUNTS
+        -- ====================================================
+
+        CASE
+          WHEN NULLIF(TRIM(s.claimable_discount), '') <> ''
+          THEN REPLACE(TRIM(s.claimable_discount), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.non_claimable_discount), '') <> ''
+          THEN REPLACE(TRIM(s.non_claimable_discount), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.non_claimable_discount_total), '') <> ''
+          THEN REPLACE(TRIM(s.non_claimable_discount_total), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.trade_discount), '') <> ''
+          THEN REPLACE(TRIM(s.trade_discount), ',', '')::numeric
+          ELSE NULL
+        END,
+
+        CASE
+          WHEN NULLIF(TRIM(s.claimable_discount_total), '') <> ''
+          THEN REPLACE(TRIM(s.claimable_discount_total), ',', '')::numeric
+          ELSE NULL
+        END,
+
+
+        -- ====================================================
+        -- ANCHOR RECEIVABLE
+        -- ====================================================
+
+        CASE
+          WHEN NULLIF(TRIM(s.anchor_receivable), '') <> ''
+          THEN REPLACE(TRIM(s.anchor_receivable), ',', '')::numeric
+          ELSE NULL
+        END,
+
+
+        -- ====================================================
+        -- MAIN METRIC: NMV
+        -- ====================================================
+
+        CASE
+          WHEN NULLIF(TRIM(s.nmv), '') <> ''
+          THEN REPLACE(TRIM(s.nmv), ',', '')::numeric
+          ELSE NULL
+        END,
+
+
+        -- ====================================================
+        -- PICK LIST IDS
+        -- Example: [3066700]
+        -- ====================================================
+
+        CASE
+
           WHEN TRIM(COALESCE(s.pick_list_ids, '')) = ''
             THEN NULL
 
@@ -705,25 +806,32 @@ async function transformAndLoad(client) {
             THEN NULL
 
           ELSE
+
             string_to_array(
+
               regexp_replace(
                 TRIM(s.pick_list_ids),
-                '[\\[\\]\\s]',
+                '[\[\]\s]',
                 '',
                 'g'
               ),
+
               ','
+
             )::bigint[]
+
         END,
 
 
-        -- ----------------------------------------------------
+        -- ====================================================
         -- OTHER
-        -- ----------------------------------------------------
+        -- ====================================================
 
-        CASE WHEN NULLIF(TRIM(s.sku_weight_in_gm), '') <> ''
+        CASE
+          WHEN NULLIF(TRIM(s.sku_weight_in_gm), '') <> ''
           THEN REPLACE(TRIM(s.sku_weight_in_gm), ',', '')::numeric
-          ELSE NULL END,
+          ELSE NULL
+        END,
 
         CASE
           WHEN NULLIF(TRIM(s.week_number), '') ~ '^-?[0-9]+$'
@@ -733,27 +841,41 @@ async function transformAndLoad(client) {
 
         now()
 
+
       FROM public.stg_cpg_sku_order_line s
 
+
       WHERE
+
         NULLIF(TRIM(s.db_id), '') IS NOT NULL
+
         AND TRIM(s.db_id) ~ '^[0-9]+$'
 
-        AND NULLIF(TRIM(s.delivered_date), '') IS NOT NULL
+        AND NULLIF(TRIM(s.delivered_date), '') IS NOT NULL;
     `);
 
+    console.log(
+      "fact_cpg_sku_order_line loaded."
+    );
 
-    // --------------------------------------------------------
-    // COMMIT
-    // --------------------------------------------------------
+
+    // ========================================================
+    // COMMIT TRANSACTION
+    // ========================================================
 
     await client.query("COMMIT");
 
-    console.log("Transformation and final load completed.");
+    console.log("");
+    console.log("Transformation committed successfully.");
 
   } catch (error) {
 
     await client.query("ROLLBACK");
+
+    console.error("");
+    console.error(
+      "Transformation failed. Transaction rolled back."
+    );
 
     throw error;
   }
@@ -762,36 +884,95 @@ async function transformAndLoad(client) {
 
 // ============================================================
 // STEP 5
-// VALIDATE DATA
+// VALIDATE FINAL DATA
 // ============================================================
 
 async function validateData(client) {
 
   console.log("");
-  console.log("========== VALIDATION ==========");
+  console.log("========================================");
+  console.log("STEP 4: VALIDATION");
+  console.log("========================================");
 
-  const result = await client.query(`
+
+  // ----------------------------------------------------------
+  // STAGING
+  // ----------------------------------------------------------
+
+  const stagingResult = await client.query(`
+    SELECT
+      COUNT(*) AS staging_rows
+    FROM public.stg_cpg_sku_order_line;
+  `);
+
+
+  // ----------------------------------------------------------
+  // FACT SUMMARY
+  // ----------------------------------------------------------
+
+  const factResult = await client.query(`
     SELECT
       COUNT(*) AS row_count,
       COUNT(DISTINCT db_id) AS db_count,
       COUNT(DISTINCT product_id) AS product_count,
-      MIN(delivered_date) AS min_delivered_date,
-      MAX(delivered_date) AS max_delivered_date,
+      COUNT(DISTINCT dsr_id) AS dsr_count,
+      MIN(delivered_date) AS first_delivered_date,
+      MAX(delivered_date) AS last_delivered_date,
       COALESCE(SUM(nmv), 0) AS total_nmv
     FROM public.fact_cpg_sku_order_line;
   `);
 
-  console.table(result.rows);
 
+  // ----------------------------------------------------------
+  // DIMENSION COUNTS
+  // ----------------------------------------------------------
 
-  const stagingResult = await client.query(`
-    SELECT COUNT(*) AS staging_row_count
-    FROM public.stg_cpg_sku_order_line;
+  const dimensionResult = await client.query(`
+    SELECT
+      (SELECT COUNT(*) FROM public.dim_db)
+        AS dim_db_rows,
+
+      (SELECT COUNT(*) FROM public.dim_product)
+        AS dim_product_rows,
+
+      (SELECT COUNT(*) FROM public.dim_dsr)
+        AS dim_dsr_rows,
+
+      (SELECT COUNT(*) FROM public.dim_date)
+        AS dim_date_rows;
   `);
 
+
+  console.log("");
+  console.log("STAGING:");
   console.table(stagingResult.rows);
 
-  console.log("================================");
+  console.log("");
+  console.log("FACT TABLE:");
+  console.table(factResult.rows);
+
+  console.log("");
+  console.log("DIMENSIONS:");
+  console.table(dimensionResult.rows);
+
+
+  // ----------------------------------------------------------
+  // ENSURE FACT TABLE IS NOT EMPTY
+  // ----------------------------------------------------------
+
+  const factRows = Number(
+    factResult.rows[0].row_count
+  );
+
+  if (factRows === 0) {
+    throw new Error(
+      "Validation failed: fact_cpg_sku_order_line contains 0 rows."
+    );
+  }
+
+
+  console.log("");
+  console.log("Validation completed successfully.");
 }
 
 
@@ -803,69 +984,137 @@ async function main() {
 
   validateEnvironment();
 
+
   const tempFile = path.join(
     os.tmpdir(),
     `cpg_sku_order_dump_${Date.now()}.csv`
   );
 
+
   const client = createSupabaseClient();
+
 
   try {
 
+    console.log("");
     console.log("========================================");
     console.log("CPG METABASE → SUPABASE SYNC");
     console.log("========================================");
 
-    // Connect
+
+    // --------------------------------------------------------
+    // CONNECT TO SUPABASE
+    // --------------------------------------------------------
+
+    console.log("");
     console.log("Connecting to Supabase...");
+
     await client.connect();
 
     console.log("Connected to Supabase.");
 
-    // Download from Metabase
+
+    // --------------------------------------------------------
+    // FETCH METABASE DATA
+    // --------------------------------------------------------
+
     await downloadMetabaseCSV(tempFile);
 
-    // Load raw data
-    await loadCSVToStaging(client, tempFile);
 
-    // Transform + final load
+    // --------------------------------------------------------
+    // LOAD RAW DATA
+    // --------------------------------------------------------
+
+    await loadCSVToStaging(
+      client,
+      tempFile
+    );
+
+
+    // --------------------------------------------------------
+    // TRANSFORM + LOAD FINAL TABLES
+    // --------------------------------------------------------
+
     await transformAndLoad(client);
 
-    // Validation
+
+    // --------------------------------------------------------
+    // VALIDATION
+    // --------------------------------------------------------
+
     await validateData(client);
 
+
+    // --------------------------------------------------------
+    // SUCCESS
+    // --------------------------------------------------------
+
     console.log("");
-    console.log("SYNC COMPLETED SUCCESSFULLY.");
+    console.log("========================================");
+    console.log("SYNC COMPLETED SUCCESSFULLY");
+    console.log("========================================");
 
   } catch (error) {
 
     console.error("");
+    console.error("========================================");
     console.error("SYNC FAILED");
+    console.error("========================================");
+
     console.error(error);
 
     process.exitCode = 1;
 
   } finally {
 
+    // --------------------------------------------------------
+    // CLOSE DATABASE
+    // --------------------------------------------------------
+
     try {
+
       await client.end();
+
+      console.log("");
+      console.log("Supabase connection closed.");
+
     } catch (error) {
-      console.error("Error closing database connection:", error.message);
+
+      console.error(
+        "Error closing Supabase connection:",
+        error.message
+      );
     }
 
-    // Delete temporary CSV
+
+    // --------------------------------------------------------
+    // DELETE TEMP CSV
+    // --------------------------------------------------------
+
     try {
+
       if (fs.existsSync(tempFile)) {
+
         fs.unlinkSync(tempFile);
+
+        console.log(
+          "Temporary CSV deleted."
+        );
       }
+
     } catch (error) {
+
       console.error(
-        "Could not delete temporary file:",
+        "Could not delete temporary CSV:",
         error.message
       );
     }
   }
 }
 
+
+// ============================================================
+// START
+// ============================================================
 
 main();
