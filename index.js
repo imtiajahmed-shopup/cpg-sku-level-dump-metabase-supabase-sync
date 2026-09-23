@@ -615,7 +615,7 @@ async function transformAndLoad(client) {
           WHEN NULLIF(TRIM(s.created_at), '') IS NOT NULL
           THEN to_timestamp(
             TRIM(s.created_at),
-            'FMMonth DD, YYYY, HH12:MI AM'
+            'YYYY-MM-DD"T"HH24:MI:SS'
           )
           ELSE NULL
         END,
@@ -624,7 +624,7 @@ async function transformAndLoad(client) {
           WHEN NULLIF(TRIM(s.updated_at), '') IS NOT NULL
           THEN to_timestamp(
             TRIM(s.updated_at),
-            'FMMonth DD, YYYY, HH12:MI AM'
+            'YYYY-MM-DD"T"HH24:MI:SS'
           )
           ELSE NULL
         END,
@@ -633,7 +633,7 @@ async function transformAndLoad(client) {
           WHEN NULLIF(TRIM(s.delivered_date), '') IS NOT NULL
           THEN to_timestamp(
             TRIM(s.delivered_date),
-            'FMMonth DD, YYYY, HH12:MI AM'
+            'YYYY-MM-DD"T"HH24:MI:SS'
           )
           ELSE NULL
         END,
@@ -647,7 +647,7 @@ async function transformAndLoad(client) {
         (
           to_timestamp(
             TRIM(s.delivered_date),
-            'FMMonth DD, YYYY, HH12:MI AM'
+            'YYYY-MM-DD"T"HH24:MI:SS'
           )
         )::date,
 
